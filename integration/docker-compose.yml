@@ -1,0 +1,57 @@
+# PostgreSQL and a three-node YugabyteDB cluster, one node per zone, for
+# test/eysql_integration_SUITE.erl. Start everything with integration/run.sh.
+name: eysql-it
+
+x-yugabyte: &yugabyte
+  image: yugabytedb/yugabyte:${YB_VERSION:-2026.1.2.0-b137}
+  healthcheck:
+    test: ["CMD-SHELL", "bin/ysqlsh -h $$(hostname) -U yugabyte -c 'select 1' >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 5s
+    retries: 60
+    start_period: 20s
+
+services:
+  postgres:
+    image: postgres:${PG_VERSION:-17}
+    container_name: eysql-postgres
+    environment:
+      POSTGRES_USER: eysql
+      POSTGRES_PASSWORD: eysql
+      POSTGRES_DB: eysql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eysql"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  yb1:
+    <<: *yugabyte
+    container_name: eysql-yb1
+    hostname: yb1
+    command: >
+      bin/yugabyted start --background=false --advertise_address=yb1
+      --cloud_location=gcp.us-east1.us-east1-b
+      --tserver_flags=yb_enable_read_committed_isolation=true
+
+  yb2:
+    <<: *yugabyte
+    container_name: eysql-yb2
+    hostname: yb2
+    depends_on:
+      yb1: {condition: service_healthy}
+    command: >
+      bin/yugabyted start --background=false --advertise_address=yb2 --join=yb1
+      --cloud_location=gcp.us-east1.us-east1-c
+      --tserver_flags=yb_enable_read_committed_isolation=true
+
+  yb3:
+    <<: *yugabyte
+    container_name: eysql-yb3
+    hostname: yb3
+    depends_on:
+      yb2: {condition: service_healthy}
+    command: >
+      bin/yugabyted start --background=false --advertise_address=yb3 --join=yb1
+      --cloud_location=gcp.us-east1.us-east1-d
+      --tserver_flags=yb_enable_read_committed_isolation=true

@@ -1,0 +1,10 @@
+{application, eysql, [
+    {description, "Topology-aware load balancing and failover for epgsql, for YugabyteDB and PostgreSQL"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, ssl, epgsql]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/vonix-networks/eysql"}]}
+]}.
