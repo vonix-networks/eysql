@@ -67,7 +67,7 @@
 -spec open(binary(), inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
 open(Host, Port, Settings) ->
     #{username := User, password := Password} = Settings,
-    Opts = connect_opts(Port, Settings),
+    Opts = connect_opts(Host, Port, Settings),
     {ok, Conn} = epgsql_sock:start_link(),
     true = unlink(Conn),
     Monitor = erlang:monitor(process, Conn),
@@ -105,13 +105,38 @@ link_caller(Conn) ->
         error:noproc -> {error, closed}
     end.
 
-connect_opts(Port, Settings) ->
+connect_opts(Host, Port, Settings) ->
     Passed = maps:with([database, ssl, ssl_opts, tcp_opts, application_name], Settings),
     Extra = maps:get(epgsql_opts, Settings, #{}),
     Opts = maps:merge(Extra, Passed),
-    Opts#{port => Port,
-          timeout => maps:get(connect_timeout, Settings, 10000)
-         }.
+    with_server_name(Host, Opts#{port => Port,
+                                 timeout => maps:get(connect_timeout, Settings, 10000)
+                                }).
+
+%% epgsql starts TLS on a TCP connection it has already opened, so OTP knows
+%% the server only by the address it is connected to, and checks the
+%% certificate against that address. A server dialled by name is checked
+%% against the name instead, as libpq's and pgjdbc's `sslmode=verify-full'
+%% check the host they connect to: the name goes in as the connection's
+%% `server_name_indication', which OTP both sends and checks. A server
+%% dialled by IP address is still checked against the address, and a
+%% `server_name_indication' already in `ssl_opts', a name or `disable',
+%% applies to every server as before.
+with_server_name(Host, #{ssl := Ssl} = Opts) when Ssl =/= false ->
+    SslOpts = maps:get(ssl_opts, Opts, []),
+    Name = unicode:characters_to_list(Host),
+    case proplists:is_defined(server_name_indication, SslOpts) orelse is_address(Name) of
+        true -> Opts;
+        false -> Opts#{ssl_opts => [{server_name_indication, Name} | SslOpts]}
+    end;
+with_server_name(_Host, Opts) ->
+    Opts.
+
+is_address(Name) ->
+    case inet:parse_address(Name) of
+        {ok, _} -> true;
+        {error, _} -> false
+    end.
 
 set_statement_timeout(_Conn, undefined) ->
     ok;

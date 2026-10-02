@@ -85,7 +85,7 @@ Text, such as `username`, a host or `topology_keys`, is a string or a UTF-8 bina
 | `hosts` | `["localhost"]` | Seed hosts: names, or `{Name, Port}`. A DNS name that resolves to several servers, such as a headless Kubernetes service, is a good seed. |
 | `port` | `5433` | Port for hosts given without one. PostgreSQL uses 5432. |
 | `username`, `password`, `database` | `yugabyte`, empty, the username | As for epgsql. `password` may be any binary, or a zero-arity fun that returns it. See [Passwords in reports](#passwords-in-reports). `database` defaults to the username, as in pgjdbc and libpq. |
-| `ssl`, `ssl_opts` | `false`, `[]` | Passed to epgsql as given. `true` uses TLS when the server offers it, and `required` insists on it. OTP 26 and later verify the server's certificate by default, so `ssl_opts` need a CA. See [TLS](#tls). |
+| `ssl`, `ssl_opts` | `false`, `[]` | Passed to epgsql, with the host each connection dialled as its `server_name_indication` unless `ssl_opts` sets one. `true` uses TLS when the server offers it, and `required` insists on it. OTP 26 and later verify the server's certificate by default, so `ssl_opts` need a CA. See [TLS](#tls). |
 | `connect_timeout` | `10000` | Per connection attempt, for the TCP connect and the TLS handshake. pgjdbc's `connectTimeout` defaults to the same 10 seconds. |
 | `statement_timeout` | none | Set on each connection with `SET statement_timeout`. |
 | `socket_timeout` | `infinity` | How long a call on a pooled connection waits for the server, in milliseconds. When it runs out, eysql closes the connection and the call returns `{error, {connection_lost, socket_timeout}}`. It covers `equery/3`, `squery/2`, the BEGIN, COMMIT and ROLLBACK of `transaction/2,3`, and `eysql_conn:equery/3` and `squery/2` called inside `with_connection` or `transaction`, or on a connection you checked out. epgsql's own functions, called on the connection directly, wait for as long as the server takes. Off by default, as pgjdbc's `socketTimeout` is. See [Dead connections](#dead-connections). |
@@ -110,7 +110,7 @@ There are no health check options. `health_check_interval` and `health_check_tim
 
 `ssl => required` encrypts every connection and fails if the server does not offer TLS. `ssl => true` goes on unencrypted when the server does not offer TLS, as libpq's `sslmode=prefer` does. When the server does offer TLS, a failed certificate check fails the connection with either setting.
 
-eysql passes `ssl_opts` to epgsql exactly as you give them, and never turns certificate checks off. The ssl application in OTP 26 and later verifies the server's certificate by default, so TLS needs a CA to check it against:
+eysql passes `ssl_opts` to epgsql, adding only the name to check, and never turns certificate checks off. The ssl application in OTP 26 and later verifies the server's certificate by default, so TLS needs a CA to check it against:
 
 ```erlang
 ssl => required,
@@ -123,15 +123,16 @@ For the operating system's trust store, use `{cacerts, public_key:cacerts_get()}
 {error, {ssl_negotiation_failed, {options, incompatible, [{verify, verify_peer}, {cacerts, undefined}]}}}
 ```
 
-With a CA, OTP checks the certificate chain, then the server's address. epgsql starts TLS on a TCP connection it has already opened, so OTP checks the certificate against the IP address it is connected to, not against the host name. A certificate that names the server only by DNS name fails that check, with a TLS alert that includes `hostname_check_failed`. To pass it, do one of these:
+With a CA, OTP checks the certificate chain, then the server's name, as libpq's and pgjdbc's `sslmode=verify-full` do: the certificate must list the host each connection dialled as a subject alternative name. That is the seed host for the first connection, and each server's `host` or `public_ip` from `yb_servers()` after that, so on YugabyteDB every server's certificate lists its own name and the seed's. A certificate can list several names; the check passes when the one dialled is among them. A host given as an IP address is checked against the address, so the certificate must list that address.
 
-- Give each server a certificate that lists its IP address as a subject alternative name. OTP then checks each connection against the address of the server it went to.
-- Add `{server_name_indication, "yb.example.com"}` to `ssl_opts`. OTP then checks that one name on every server, so it suits a certificate the servers share.
-- Add `{server_name_indication, disable}` to check the chain only, as libpq's `sslmode=verify-ca` does.
+epgsql starts TLS on a TCP connection it has already opened, which leaves OTP knowing the server only by its address. eysql therefore passes the host it dialled, when that is a name, as the connection's `server_name_indication`, which OTP both sends and checks. A certificate that fails the check fails the connection with a TLS alert that includes `hostname_check_failed`.
+
+To check something else, set `server_name_indication` in `ssl_opts` yourself. It then applies to every server:
+
+- `{server_name_indication, "yb.example.com"}` checks that one name on every server, so it suits a certificate the servers share.
+- `{server_name_indication, disable}` checks the chain only, as libpq's `sslmode=verify-ca` does.
 
 To encrypt without verifying, as libpq's `sslmode=require` does, set `{verify, verify_none}` yourself. The connection then accepts any certificate, so nothing stops a man in the middle.
-
-Hostname checks by DNS name across load-balanced hosts, as `sslmode=verify-full` does them, are not supported yet. eysql passes the same `ssl_opts` for every server, so a `server_name_indication` there cannot follow the server picked.
 
 ## Passwords in reports
 

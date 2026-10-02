@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-10-02)
+
+- With TLS, a server dialled by name is checked against that name, as `sslmode=verify-full` checks it: eysql passes the host it dialled as the connection's `server_name_indication`. Before, epgsql's TLS upgrade of an open socket left OTP checking the certificate against the server's IP address, so certificates that name servers by DNS, as YugabyteDB's Helm chart issues them, failed. A server dialled by IP address is checked against the address as before, and a `server_name_indication` in `ssl_opts` still applies to every server. A certificate that lists only IP addresses now fails for a server dialled by name.
+
+## 0.1.0 (2026-09-30)
 
 First release.
 

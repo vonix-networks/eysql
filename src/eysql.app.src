@@ -1,6 +1,6 @@
 {application, eysql, [
     {description, "Topology-aware load balancing and failover for epgsql, for YugabyteDB and PostgreSQL"},
-    {vsn, "0.1.0"},
+    {vsn, "0.1.1"},
     {registered, []},
     {applications, [kernel, stdlib, ssl, epgsql]},
     {env, []},
