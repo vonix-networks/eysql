@@ -299,3 +299,45 @@ socket_timeout_test_() ->
                     eysql_config:normalize(#{socket_timeout => Value}))
       || Value <- [0, -1, 1.5, "500", undefined]]
     ].
+
+%% Off by default. A fun of one argument, or {Module, Function, Args}, kept
+%% as given; whether the function exists is found when a connection calls
+%% it. Anything else is refused, by eysql:start_link/1 too.
+after_connect_test_() ->
+    Hook = fun(Options) ->
+                   {ok, #{after_connect := H}} = eysql_config:normalize(Options),
+                   H
+           end,
+    Invalid = fun(Value) -> {error, {invalid_option, after_connect, Value}} end,
+    Fun = fun(_Conn) -> ok end,
+    External = fun erlang:is_process_alive/1,
+    [{"off by default", ?_assertEqual(undefined, Hook(#{}))},
+     {"a fun of one argument as it is", ?_assertEqual(Fun, Hook(#{after_connect => Fun}))},
+     {"an external fun as it is", ?_assertEqual(External, Hook(#{after_connect => External}))},
+     {"{Module, Function, Args} as it is",
+      ?_assertEqual({app_db, warm, [1, 2]}, Hook(#{after_connect => {app_db, warm, [1, 2]}}))},
+     {"{Module, Function, []}", ?_assertEqual({app_db, warm, []}, Hook(#{after_connect => {app_db, warm, []}}))},
+     {"undefined", ?_assertEqual(undefined, Hook(#{after_connect => undefined}))},
+     [?_assertEqual(Invalid(Value), eysql_config:normalize(#{after_connect => Value}))
+      || Value <- [fun() -> ok end, fun(_, _) -> ok end, {app_db, warm}, {app_db, warm, none},
+                   {app_db, warm, [1 | 2]}, {"app_db", warm, []}, {app_db, <<"warm">>, []},
+                   {app_db, warm, [], extra}, warm, "SELECT 1", <<"SELECT 1">>]],
+     {"from start_link",
+      ?_assertEqual(Invalid(warm), eysql:start_link(#{after_connect => warm}))}
+    ].
+
+%% A minute by default, milliseconds otherwise, or infinity. A bound of 0
+%% would fail every connection, so off is `infinity', as for socket_timeout.
+after_connect_timeout_test_() ->
+    Bound = fun(Options) ->
+                    {ok, #{after_connect_timeout := B}} = eysql_config:normalize(Options),
+                    B
+            end,
+    [{"a minute by default", ?_assertEqual(60000, Bound(#{}))},
+     {"milliseconds", ?_assertEqual(500, Bound(#{after_connect_timeout => 500}))},
+     {"infinity", ?_assertEqual(infinity, Bound(#{after_connect_timeout => infinity}))},
+     {"the longest a receive waits", ?_assertEqual(16#FFFFFFFF, Bound(#{after_connect_timeout => 16#FFFFFFFF}))},
+     [?_assertEqual({error, {invalid_option, after_connect_timeout, Value}},
+                    eysql_config:normalize(#{after_connect_timeout => Value}))
+      || Value <- [0, -1, 1.5, "500", undefined, 16#100000000]]
+    ].

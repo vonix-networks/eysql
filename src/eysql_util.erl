@@ -23,6 +23,7 @@
          decr/2,
          redact_config/1,
          redact/1,
+         redact_reason/1,
          text/1
         ]).
 
@@ -47,11 +48,19 @@ decr(Key, Map) ->
 %% @doc The config with its secrets replaced by `redacted', for printing.
 %% In its `settings', the password always goes, and `ssl_opts' and
 %% `epgsql_opts' go whole unless they are empty: both can hold key
-%% passwords, keys and other credentials.
+%% passwords, keys and other credentials. An `after_connect' given as
+%% `{Module, Function, Args}' loses its `Args', which the application may
+%% have put a credential in; a fun prints without the values it captured,
+%% and stays as it is.
 -spec redact_config(map()) -> map().
 redact_config(#{settings := Settings} = Config) when is_map(Settings) ->
-    Config#{settings := maps:map(fun redact_setting/2, Settings)};
+    redact_hook(Config#{settings := maps:map(fun redact_setting/2, Settings)});
 redact_config(Config) ->
+    Config.
+
+redact_hook(#{after_connect := {Module, Function, _Args}} = Config) ->
+    Config#{after_connect := {Module, Function, redacted}};
+redact_hook(Config) ->
     Config.
 
 redact_setting(password, _Password) -> redacted;
@@ -76,6 +85,24 @@ redact(Tuple) when is_tuple(Tuple) ->
     list_to_tuple(redact(tuple_to_list(Tuple)));
 redact(Term) ->
     Term.
+
+%% @doc A failure's reason as it may be logged: {@link redact/1}, and the
+%% password hidden wherever it sits in a proplist, as `{password, _}', and in
+%% a map, such as epgsql's connect options, under a `password' key, atom or
+%% binary. A connect error can echo options, as an ssl option error does the
+%% option it rejects.
+-spec redact_reason(term()) -> term().
+redact_reason(Reason) ->
+    hide(redact(Reason)).
+
+hide({password, _}) -> {password, redacted};
+hide([Head | Tail]) -> [hide(Head) | hide(Tail)];
+hide(Tuple) when is_tuple(Tuple) -> list_to_tuple(hide(tuple_to_list(Tuple)));
+hide(Map) when is_map(Map) -> maps:map(fun hide/2, Map);
+hide(Term) -> Term.
+
+hide(Key, _Value) when Key =:= password; Key =:= <<"password">> -> redacted;
+hide(_Key, Value) -> hide(Value).
 
 %% @doc `Value' as a UTF-8 binary, if it is Unicode text: a string, a UTF-8
 %% binary, or a list mixing the two, as `unicode:characters_to_binary/1'

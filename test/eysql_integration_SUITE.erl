@@ -24,8 +24,13 @@
          transaction_connection_kept/1,
          squery_begin_discarded/1,
          pool_stops_under_query/1,
-         socket_timeout_cuts_query/1
+         socket_timeout_cuts_query/1,
+         after_connect_prepares/1,
+         after_connect_failure_keeps_servers/1
         ]).
+
+%% The after_connect hook of after_connect_prepares/1.
+-export([prepare_session/2]).
 
 -define(ZONES, [<<"us-east1-b">>, <<"us-east1-c">>, <<"us-east1-d">>]).
 
@@ -41,7 +46,7 @@ groups() ->
 both() ->
     [idle_connection_kept, open_transaction_discarded, failed_transaction_discarded,
      transaction_connection_kept, squery_begin_discarded, pool_stops_under_query,
-     socket_timeout_cuts_query].
+     socket_timeout_cuts_query, after_connect_prepares, after_connect_failure_keeps_servers].
 
 init_per_group(Engine, Config) ->
     [{engine, Engine} | Config].
@@ -366,6 +371,62 @@ socket_timeout_cuts_query(Config) ->
     ?assertMatch({ok, _, [{1}]}, eysql:equery(Pool, "SELECT 1", [])),
     {After, _} = holder(Pool, Config),
     ?assertNotEqual(Before, After),
+    ?assertMatch(#{failed := [], rejected := [], read_only := []}, eysql:cluster_info(Pool)),
+    stop(Pool).
+
+%% Every pooled connection runs after_connect before it serves a query: the
+%% first three, and the ones that replace them as each reaches its 1 s
+%% lifetime under load. The hook waits a little, so that a connection handed
+%% out before its hook had finished would show, then marks its session and
+%% records the connection and its backend. Each query checks, as it gets its
+%% connection, that the hook has recorded it, and reads the backend and the
+%% mark: the same backend, marked. Each connection ran the hook once.
+after_connect_prepares(Config) ->
+    Table = ets:new(?MODULE, [public, duplicate_bag]),
+    Pool = one(Config, #{pool_size => 3, max_lifetime => 1000, lifetime_jitter => 0,
+                         rebalance_interval => 200,
+                         after_connect => {?MODULE, prepare_session, [Table]}}),
+    Serve = fun(C) ->
+                    Recorded = ets:lookup(Table, C),
+                    {ok, _, [{Backend, Mark}]} =
+                        epgsql:equery(C, "SELECT pg_backend_pid(), current_setting('eysql.prepared', true)", []),
+                    {C, Backend, Mark, Recorded}
+            end,
+    Self = self(),
+    Until = erlang:monotonic_time(millisecond) + 4000,
+    Workers = [spawn_link(fun() -> Self ! {served, self(), serve_until(Pool, Serve, Until, [])} end)
+               || _ <- [1, 2, 3]],
+    Served = lists:append([receive {served, W, S} -> S after 30000 -> ct:fail(no_result) end || W <- Workers]),
+    Conns = lists:usort([C || {C, _, _, _} <- Served]),
+    Prepared = ets:tab2list(Table),
+    ct:pal("~b queries on ~b connections; the hook ran ~b times", [length(Served), length(Conns), length(Prepared)]),
+    ?assertEqual([], [S || S <- Served, tuple_size(S) =/= 4]),
+    ?assertEqual([], [S || {C, Backend, Mark, Recorded} = S <- Served,
+                           {Mark, Recorded} =/= {<<"yes">>, [{C, Backend}]}]),
+    ?assert(length(Conns) > 3),
+    ?assertEqual(length(Prepared), length(lists:usort([C || {C, _} <- Prepared]))),
+    stop(Pool).
+
+serve_until(Pool, Serve, Until, Acc) ->
+    case erlang:monotonic_time(millisecond) < Until of
+        true -> serve_until(Pool, Serve, Until, [eysql:with_connection(Pool, Serve, 10000) | Acc]);
+        false -> Acc
+    end.
+
+prepare_session(Conn, Table) ->
+    {ok, _, _} = eysql_conn:squery(Conn, "SELECT pg_sleep(0.2)"),
+    {ok, _, [{Backend, <<"yes">>}]} =
+        eysql_conn:equery(Conn, "SELECT pg_backend_pid(), set_config('eysql.prepared', 'yes', false)", []),
+    true = ets:insert(Table, {Conn, Backend}),
+    ok.
+
+%% A hook whose statement the server rejects: no connection joins the pool,
+%% a checkout fails with the server's error, and no server is left out.
+after_connect_failure_keeps_servers(Config) ->
+    Pool = one(Config, #{after_connect => fun(C) -> eysql_conn:squery(C, "SELECT no_such_column") end}),
+    {error, {after_connect, Error}} = eysql:checkout(Pool, 10000),
+    ?assertEqual(<<"42703">>, eysql_error:code(Error)),
+    ?assertMatch(#{idle := 0, leased := 0}, eysql:stats(Pool)),
     ?assertMatch(#{failed := [], rejected := [], read_only := []}, eysql:cluster_info(Pool)),
     stop(Pool).
 

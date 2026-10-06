@@ -5,6 +5,10 @@
 -import(eysql_test_util, [config/1, three/0, key/1, wait_until/2, wait_until/3,
                           refreshing_until/3, fail/2]).
 
+%% after_connect hooks given as {Module, Function, Args}, and a logger
+%% handler, for the test that reads what the pool logs.
+-export([flaky/3, tagged/3, log/2]).
+
 pool_test_() ->
     {foreach,
      fun() -> eysql_fake_driver:start() end,
@@ -52,6 +56,35 @@ pool_test_() ->
       {"status and crash reports show no secrets", fun redacts_status/0},
       {"driver/1 makes no call to the pool", fun driver_without_call/0}
      ]}.
+
+after_connect_test_() ->
+    {foreach,
+     fun() -> eysql_fake_driver:start() end,
+     fun(_) -> eysql_fake_driver:stop() end,
+     [{"after_connect runs once on each pooled connection, and on no discovery's or probe's",
+       {timeout, 15, fun hook_once_per_connection/0}},
+      {"a connection is not handed out before its after_connect returns", fun hook_before_lease/0},
+      {"stopping the pool stops a running after_connect and closes its connection",
+       fun hook_stops_with_pool/0}]
+     ++ [{"after_connect failing with " ++ What ++ ": the connection closes, the hosts stay in, "
+          "and the pool refills", {timeout, 15, fun() -> hook_fails(Mode, Reasons) end}}
+         || {What, Mode, Reasons} <- hook_failures()]
+     ++ [{"a connection recycled after max_lifetime is replaced through after_connect",
+          fun hook_on_recycled/0},
+         {"a connection moved by a rebalance is replaced through after_connect",
+          {timeout, 15, fun hook_on_rebalanced/0}},
+         {"{Module, Function, Args} is called with the connection first", fun hook_mfa_args/0},
+         {"after_connect failing on one host: the pool keeps its other connections and refills elsewhere",
+          {timeout, 20, fun hook_fails_on_one_host/0}},
+         {"after_connect's failures are logged once per run and host", {timeout, 20, fun hook_logs_once/0}},
+         {"a hook's own {error, timeout} is its reason, with after_connect_timeout infinity",
+          fun hook_returns_timeout/0},
+         {"a connection that dies as its hook fails is still reported", fun hook_conn_dies/0},
+         {"no hook runs for a pool that has gone", fun hook_not_run_for_gone_pool/0},
+         {"a config without the after_connect keys, as from 0.1.1, works", fun hook_keys_optional/0},
+         {"status and logs show nothing a hook fun captured", fun hook_closure_hidden/0},
+         {"status shows no arguments of a {Module, Function, Args} hook", fun hook_mfa_args_hidden/0}
+        ]}.
 
 start(Overrides) ->
     eysql_fake_driver:set_servers(three()),
@@ -758,3 +791,438 @@ driver_without_call() ->
 
 terms_of(Pool) ->
     [Key || {Key, _} <- persistent_term:get(), is_tuple(Key), lists:member(Pool, tuple_to_list(Key))].
+
+%%%=============================================================================
+%%% after_connect
+%%%=============================================================================
+
+%% A table the hooks below record each call in, as {Conn, HookProcess}. A
+%% hook writes it before it returns, so a connection handed out is in it.
+recorder() ->
+    ets:new(?MODULE, [public, duplicate_bag]).
+
+recording(Table) ->
+    fun(Conn) -> true = ets:insert(Table, {Conn, self()}), ok end.
+
+hooked(Table) ->
+    [Conn || {Conn, _Runner} <- ets:tab2list(Table)].
+
+%% A table holding the mode flaky/3 follows.
+mode_table(Mode) ->
+    Table = ets:new(?MODULE, [public]),
+    true = ets:insert(Table, {mode, Mode}),
+    Table.
+
+%% An after_connect hook, as {?MODULE, flaky, [Test, Table]}: it tells the
+%% test about the connection, then does what the mode in `Table' says.
+flaky(Conn, Test, Table) ->
+    Test ! {hooked, self(), Conn},
+    case ets:lookup_element(Table, mode, 2) of
+        ok -> {ok, Conn};
+        error -> {error, nope};
+        raise -> erlang:error(boom);
+        throw -> throw(boom);
+        exit -> exit(boom);
+        other -> sometimes;
+        {fail_on, Hosts} ->
+            case [Key || Key <- Hosts, lists:member(Conn, eysql_fake_driver:conns_to(Key))] of
+                [] -> ok;
+                _ -> {error, nope}
+            end;
+        in_transaction -> ok;
+        close ->
+            Monitor = erlang:monitor(process, Conn),
+            eysql_fake_driver:close(Conn),
+            receive {'DOWN', Monitor, process, Conn, _} -> ok end;
+        hang -> receive after infinity -> ok end
+    end.
+
+%% The {hooked, Runner, Conn} messages flaky/3 has sent so far.
+hooked_messages() ->
+    receive {hooked, Runner, Conn} -> [{Runner, Conn} | hooked_messages()]
+    after 0 -> []
+    end.
+
+%% How a hook fails, the mode flaky/3 follows for it, and the reasons a
+%% checkout that gets no connection may see. A connection the hook closes is
+%% found either by its exit or by its status.
+hook_failures() ->
+    [{"{error, _}", error, [nope]},
+     {"an error raised", raise, [{error, boom}]},
+     {"a throw", throw, [{throw, boom}]},
+     {"an exit", exit, [{exit, boom}]},
+     {"another return value", other, [{bad_return, sometimes}]},
+     {"a transaction left open", in_transaction, [{transaction_status, in_transaction}]},
+     {"the connection closed", close, [{connection_lost, normal}, {transaction_status, unknown}]},
+     {"a timeout", hang, [{after_connect_timeout, 200}]}].
+
+%% Discovery and a probe open connections of their own, and the hook runs on
+%% neither: it ran once on each of the pool's three connections, and on
+%% nothing else, though discoveries ran and c was probed.
+hook_once_per_connection() ->
+    Table = recorder(),
+    Pool = start(#{pool_size => 3, after_connect => recording(Table)}),
+    full(Pool, 3),
+    Cluster = eysql_pool:cluster(Pool),
+    C = key(<<"c">>),
+    Opens = eysql_fake_driver:opens(C),
+    Discoveries = eysql_fake_driver:discoveries(),
+    ?assert(Discoveries >= 1),
+    fail(Cluster, C),
+    refreshing_until(Cluster, fun() -> failed(Pool) =:= [] end, probed),
+    ?assert(eysql_fake_driver:opens(C) > Opens),
+    ?assert(eysql_fake_driver:discoveries() > Discoveries),
+    Conns = [begin {ok, Conn} = eysql_pool:checkout(Pool, 1000), Conn end || _ <- [1, 2, 3]],
+    ?assertEqual(lists:sort(Conns), lists:sort(hooked(Table))),
+    stop(Pool).
+
+%% The hook holds the pool's one connection. Meanwhile it counts as opening,
+%% and a checkout waits for it rather than get it; once the hook returns, the
+%% waiting checkout gets that connection.
+hook_before_lease() ->
+    Self = self(),
+    Hook = fun(Conn) -> Self ! {hooking, self(), Conn}, receive go -> ok end end,
+    Pool = start(#{pool_size => 1, after_connect => Hook}),
+    {Runner, Conn} = receive {hooking, R, C} -> {R, C} after 2000 -> error(no_hook) end,
+    ?assertEqual({0, 1, 0}, {stat(Pool, idle), stat(Pool, opening), stat(Pool, leased)}),
+    ?assertEqual({error, checkout_timeout}, eysql_pool:checkout(Pool, 200)),
+    Getter = spawn_link(fun() ->
+                                Self ! {got, self(), eysql_pool:checkout(Pool, 5000)},
+                                receive release -> ok end
+                        end),
+    wait_until(fun() -> stat(Pool, waiting) =:= 1 end, waiting),
+    receive {got, Getter, Early} -> error({handed_out_early, Early}) after 300 -> ok end,
+    Runner ! go,
+    receive {got, Getter, Got} -> ?assertEqual({ok, Conn}, Got) after 2000 -> error(not_served) end,
+    ?assertEqual({0, 0, 1}, {stat(Pool, idle), stat(Pool, opening), stat(Pool, leased)}),
+    unlink(Getter),
+    exit(Getter, kill),
+    stop(Pool).
+
+%% The pool stops while a hook runs, with the default minute to run in. The
+%% opener stops the hook and closes the connection at once.
+hook_stops_with_pool() ->
+    Self = self(),
+    Hook = fun(Conn) -> Self ! {hooking, self(), Conn}, receive go -> ok end end,
+    Pool = start(#{pool_size => 1, after_connect => Hook}),
+    {Runner, Conn} = receive {hooking, R, C} -> {R, C} after 2000 -> error(no_hook) end,
+    stop(Pool),
+    wait_until(fun() -> alive([Runner, Conn]) =:= [] end, stopped, 2000),
+    ?assertEqual([], eysql_fake_driver:conns()).
+
+%% Both connections fail the hook, so a checkout, with no connection left
+%% to wait for, fails with the reason. Both openers have reported: none is
+%% opening and none idle until the refill a second later. The hook's
+%% processes and the connections are gone, and no host is marked: new
+%% connections may still go to all three. Once the hook works, the pool
+%% fills, every connection through the hook.
+hook_fails(Mode, Reasons) ->
+    _ = Mode =:= in_transaction andalso eysql_fake_driver:set_transaction_status(in_transaction),
+    Table = mode_table(Mode),
+    Pool = start(#{pool_size => 2, after_connect => {?MODULE, flaky, [self(), Table]},
+                   after_connect_timeout => 200}),
+    {error, {after_connect, Reason}} = eysql_pool:checkout(Pool, 3000),
+    ?assert(lists:member(Reason, Reasons)),
+    ?assertEqual({0, 0, 0}, {stat(Pool, opening), stat(Pool, idle), stat(Pool, leased)}),
+    Failed = hooked_messages(),
+    ?assert(length(Failed) >= 2),
+    wait_until(fun() -> alive(lists:append([[Runner, Conn] || {Runner, Conn} <- Failed])) =:= [] end,
+               closed),
+    #{failed := Down, rejected := Rejected, read_only := ReadOnly, placement := Placement} = snapshot(Pool),
+    ?assertEqual({[], [], []}, {Down, Rejected, ReadOnly}),
+    ?assertEqual([key(<<"a">>), key(<<"b">>), key(<<"c">>)], lists:sort(Placement)),
+    true = ets:insert(Table, {mode, ok}),
+    eysql_fake_driver:set_transaction_status(idle),
+    full(Pool, 2),
+    ?assertEqual(0, stat(Pool, opening)),
+    Conns = [begin {ok, C} = eysql_pool:checkout(Pool, 1000), C end || _ <- [1, 2]],
+    ?assertEqual([], Conns -- [Conn || {_, Conn} <- hooked_messages()]),
+    stop(Pool).
+
+%% Every connection is replaced after 200 ms, and each replacement runs the
+%% hook, once, before anyone gets it.
+hook_on_recycled() ->
+    Table = recorder(),
+    Pool = start(#{pool_size => 3, max_lifetime => 200, after_connect => recording(Table)}),
+    full(Pool, 3),
+    First = hooked(Table),
+    wait_until(fun() -> alive(First) =:= [] end, recycled, 3000),
+    full(Pool, 3),
+    Conns = [begin {ok, C} = eysql_pool:checkout(Pool, 1000), C end || _ <- [1, 2, 3]],
+    Hooked = hooked(Table),
+    ?assertEqual([], Conns -- Hooked),
+    ?assertEqual(Conns, Conns -- First),
+    ?assert(length(Hooked) > 3),
+    ?assertEqual(length(Hooked), length(lists:usort(Hooked))),
+    stop(Pool).
+
+%% a refuses at first, and the pool fills on b and c. Once a answers, a
+%% rebalance moves two connections to it, and their replacements on a run
+%% the hook as the first connections did.
+hook_on_rebalanced() ->
+    A = key(<<"a">>),
+    eysql_fake_driver:down(A),
+    Table = recorder(),
+    Pool = start(#{pool_size => 6, yb_servers_refresh_interval => 1, after_connect => recording(Table)}),
+    full(Pool, 6),
+    ?assertEqual(0, maps:get(A, by_host(Pool), 0)),
+    eysql_fake_driver:up(A),
+    wait_until(fun() -> by_host(Pool) =:= #{A => 2, key(<<"b">>) => 2, key(<<"c">>) => 2} end,
+               balanced, 8000),
+    Conns = [begin {ok, C} = eysql_pool:checkout(Pool, 1000), C end || _ <- lists:seq(1, 6)],
+    OnA = [C || C <- Conns, lists:member(C, eysql_fake_driver:conns_to(A))],
+    ?assertEqual(2, length(OnA)),
+    Hooked = hooked(Table),
+    ?assertEqual([], Conns -- Hooked),
+    ?assert(length(Hooked) >= 8),
+    ?assertEqual(length(Hooked), length(lists:usort(Hooked))),
+    stop(Pool).
+
+%% apply(Module, Function, [Conn | Args]); an epgsql-style {ok, _, _}
+%% result lets the connection in.
+hook_mfa_args() ->
+    Pool = start(#{pool_size => 1, after_connect => {?MODULE, tagged, [self(), tag]}}),
+    full(Pool, 1),
+    {ok, Conn} = eysql_pool:checkout(Pool, 1000),
+    receive {tagged, tag, Hooked} -> ?assertEqual(Conn, Hooked) after 1000 -> error(no_hook) end,
+    stop(Pool).
+
+tagged(Conn, Test, Tag) ->
+    Test ! {tagged, Tag, Conn},
+    {ok, [], []}.
+
+%% The hook fails on c only. Each time a connection goes to c it fails,
+%% but c is warned of once: at the first failure, with the reason. Once the
+%% hook passes on c, the run ends, at info, after the window (1 s here). A
+%% failure after that starts a new run, and warns again. Connections go to
+%% c only after its delay (1 s here), when one elsewhere is replaced.
+hook_logs_once() ->
+    with_log(fun hook_logs_once_run/0).
+
+hook_logs_once_run() ->
+    C = key(<<"c">>),
+    Table = mode_table({fail_on, [C]}),
+    eysql_fake_driver:set_servers(three()),
+    Config = config(#{pool_size => 3, after_connect => {?MODULE, flaky, [self(), Table]}}),
+    {ok, Pool} = eysql_pool:start_link(maps:put(log_window, 1000, Config)),
+    full(Pool, 3),
+    [{warning, Warning}] = logs_within(300),
+    ?assertEqual(["c:5433"], hosts_in(Warning)),
+    ?assertNotEqual(nomatch, string:find(Warning, "nope")),
+    %% Twice more on c, in the same run: no warning.
+    [begin
+         timer:sleep(1100),
+         Opens = eysql_fake_driver:opens(C),
+         kill_on_busiest(Pool),
+         wait_until(fun() -> eysql_fake_driver:opens(C) > Opens andalso stat(Pool, idle) =:= 3 end, tried_c)
+     end || _ <- [1, 2]],
+    ?assertEqual([], hook_logs()),
+    true = ets:insert(Table, {mode, ok}),
+    timer:sleep(1100),
+    kill_on_busiest(Pool),
+    wait_until(fun() -> maps:get(C, by_host(Pool), 0) >= 1 end, on_c),
+    ?assertMatch([{info, _}], logs_within(1500)),
+    true = ets:insert(Table, {mode, {fail_on, [C]}}),
+    [eysql_fake_driver:kill_conn(Conn) || Conn <- eysql_fake_driver:conns_to(C), is_pooled(Pool, Conn)],
+    ?assertMatch([{warning, _}], logs_within(1000)),
+    stop(Pool).
+
+%% Kill an idle connection on the host holding the most, so that the
+%% replacement goes to the host holding the fewest.
+kill_on_busiest(Pool) ->
+    {Busiest, _} = lists:last(lists:keysort(2, maps:to_list(by_host(Pool)))),
+    [Victim | _] = [Conn || Conn <- eysql_fake_driver:conns_to(Busiest), is_pooled(Pool, Conn)],
+    eysql_fake_driver:kill_conn(Victim).
+
+is_pooled(Pool, Conn) ->
+    {links, Links} = erlang:process_info(Pool, links),
+    lists:member(Conn, Links).
+
+%% The hook fails on c, one of three hosts, all in the one level a pick
+%% chooses among. The first connection to c fails it, and its replacement
+%% goes to a or b at once; so do the next ones, for c's delay (3 s here).
+%% The pool fills on a and b, spread evenly, and keeps all nine: over ten
+%% rebalances within the delay, none closes and none goes to c, and all nine
+%% can be checked out at once. After the delay, a rebalance tries c again,
+%% and the connections it moves open elsewhere when the hook still fails.
+%% Once the hook passes on c, rebalancing spreads the pool over all three.
+hook_fails_on_one_host() ->
+    [A, B, C] = [key(H) || H <- [<<"a">>, <<"b">>, <<"c">>]],
+    Table = mode_table({fail_on, [C]}),
+    Pool = start(#{pool_size => 9, failed_host_reconnect_delay_secs => 3,
+                   after_connect => {?MODULE, flaky, [self(), Table]}}),
+    full(Pool, 9),
+    wait_until(fun() -> length(eysql_fake_driver:conns()) =:= 9 end, settled),
+    #{A := OnA, B := OnB} = ByHost = by_host(Pool),
+    ?assertEqual(error, maps:find(C, ByHost)),
+    ?assert(abs(OnA - OnB) =< 1),
+    Before = lists:sort(eysql_fake_driver:conns()),
+    OpensC = eysql_fake_driver:opens(C),
+    timer:sleep(1000),
+    ?assertEqual(Before, lists:sort(eysql_fake_driver:conns())),
+    ?assertEqual({9, 0}, {stat(Pool, idle), stat(Pool, opening)}),
+    ?assertEqual(OpensC, eysql_fake_driver:opens(C)),
+    Held = [begin {ok, Conn} = eysql_pool:checkout(Pool, 1000), Conn end || _ <- lists:seq(1, 9)],
+    ?assertEqual(Before, lists:sort(Held)),
+    [eysql_pool:checkin(Pool, Conn) || Conn <- Held],
+    ?assertMatch(#{failed := [], rejected := [], read_only := []}, snapshot(Pool)),
+    wait_until(fun() -> eysql_fake_driver:opens(C) > OpensC end, c_tried_again, 5000),
+    wait_until(fun() -> stat(Pool, idle) =:= 9 end, refilled_elsewhere),
+    ?assertEqual(error, maps:find(C, by_host(Pool))),
+    true = ets:insert(Table, {mode, ok}),
+    wait_until(fun() -> by_host(Pool) =:= #{A => 3, B => 3, C => 3} end, spread_again, 10000),
+    stop(Pool).
+
+%% A config normalized by eysql 0.1.1, as across a hot code upgrade, or
+%% built by hand, has no after_connect keys: the pool runs no hook. One
+%% with a hook and no timeout takes the default timeout.
+hook_keys_optional() ->
+    Old = maps:without([after_connect, after_connect_timeout], config(#{pool_size => 2})),
+    eysql_fake_driver:set_servers(three()),
+    {ok, Pool} = eysql_pool:start_link(Old),
+    full(Pool, 2),
+    stop(Pool),
+    Table = recorder(),
+    Partial = maps:remove(after_connect_timeout, config(#{pool_size => 2, after_connect => recording(Table)})),
+    {ok, Hooked} = eysql_pool:start_link(Partial),
+    full(Hooked, 2),
+    ?assertEqual(2, length(hooked(Table))),
+    stop(Hooked).
+
+%% With no bound on the hook, one that returns {error, timeout} fails with
+%% that reason, and the pool logs it and lives on. It fails on every host,
+%% so the open fails once it has tried them all.
+hook_returns_timeout() ->
+    with_log(fun hook_returns_timeout_run/0).
+
+hook_returns_timeout_run() ->
+    Pool = start(#{pool_size => 1, after_connect_timeout => infinity,
+                   after_connect => fun(_Conn) -> {error, timeout} end}),
+    ?assertEqual({error, {after_connect, timeout}}, eysql_pool:checkout(Pool, 3000)),
+    ?assertMatch(#{opening := 0}, eysql_pool:stats(Pool)),
+    Warnings = [Text || {warning, Text} <- hook_logs()],
+    ?assertNotEqual([], Warnings),
+    [?assertNotEqual(nomatch, string:find(Text, "(timeout)")) || Text <- Warnings],
+    stop(Pool).
+
+%% The hook kills its connection and fails. The opener still reports the
+%% failure: every open fails, so a checkout fails with the hook's reason
+%% rather than waiting out its time. The connection's exit reaches the
+%% opener while it still traps exits, so this covers the path, not the
+%% window between restoring trap_exit and unlinking that the opener now
+%% closes by unlinking first; that race has no deterministic test.
+hook_conn_dies() ->
+    Hook = fun(Conn) -> exit(Conn, kill), {error, gone} end,
+    Pool = start(#{pool_size => 1, after_connect => Hook}),
+    [?assertEqual({error, {after_connect, gone}}, eysql_pool:checkout(Pool, 3000)) || _ <- [1, 2]],
+    stop(Pool).
+
+%% The pool stops while its opener is still connecting. The connection
+%% opens after that; the opener closes it, and runs no hook on it.
+hook_not_run_for_gone_pool() ->
+    Self = self(),
+    Ref = make_ref(),
+    eysql_fake_driver:set_open_delay(300),
+    {ok, Config} = eysql_config:normalize(#{hosts => [key(<<"a">>)], driver => eysql_fake_driver,
+                                            pool_size => 1,
+                                            after_connect => fun(_C) -> Self ! {Ref, hooked}, ok end}),
+    {ok, Pool} = eysql_pool:start_link(Config),
+    wait_until(fun() -> eysql_fake_driver:opening() =/= [] end, opening),
+    stop(Pool),
+    wait_until(fun() -> eysql_fake_driver:opens(key(<<"a">>)) =:= 1 end, opened),
+    wait_until(fun() -> eysql_fake_driver:conns() =:= [] end, closed),
+    receive {Ref, hooked} -> error(hook_ran) after 200 -> ok end.
+
+%% The arguments of a {Module, Function, Args} hook can hold a credential:
+%% sys:get_status/1 shows the module and function, not them.
+hook_mfa_args_hidden() ->
+    Pool = start(#{pool_size => 1, after_connect => {?MODULE, tagged, [self(), <<"s3cret-arg">>]}}),
+    full(Pool, 1),
+    Status = lists:flatten(io_lib:format("~p", [sys:get_status(Pool)])),
+    ?assertEqual(nomatch, string:find(Status, "s3cret")),
+    ?assertMatch({match, _}, re:run(Status, "eysql_pool_tests,\\s*tagged,\\s*redacted")),
+    {ok, Conn} = eysql_pool:checkout(Pool, 1000),
+    receive {tagged, <<"s3cret-arg">>, Hooked} -> ?assertEqual(Conn, Hooked) after 1000 -> error(no_hook) end,
+    stop(Pool).
+
+hosts_in(Text) ->
+    [Host || Host <- ["a:5433", "b:5433", "c:5433"], string:find(Text, Host) =/= nomatch].
+
+%% after_connect's log lines in the next `Ms' ms, oldest first.
+logs_within(Ms) ->
+    {waiting, Logs} = wait_logs(fun(Seen) -> {waiting, Seen} end, done, Ms),
+    lists:reverse(Logs).
+
+%% Collect after_connect's log lines until `Done' of them gives `Want', or
+%% `Timeout' ms have passed; the last value either way.
+wait_logs(Done, Want, Timeout) ->
+    wait_logs(Done, Want, eysql_util:now_ms() + Timeout, []).
+
+wait_logs(Done, Want, Deadline, Logs) ->
+    case Done(Logs) of
+        Want ->
+            Want;
+        Got ->
+            Left = Deadline - eysql_util:now_ms(),
+            receive
+                {eysql_log, Level, Text} ->
+                    case string:find(Text, "after_connect") of
+                        nomatch -> wait_logs(Done, Want, Deadline, Logs);
+                        _ -> wait_logs(Done, Want, Deadline, [{Level, Text} | Logs])
+                    end
+            after max(0, Left) ->
+                    Got
+            end
+    end.
+
+%% A hook fun that captured a secret, and passes it to a function that has
+%% no clause for it: neither sys:get_status/1 nor the warning about the
+%% failure shows it. Erlang prints a fun without the values it captured,
+%% and the warning gives the hook's stack frames without their arguments.
+hook_closure_hidden() ->
+    with_log(fun hook_closure_hidden_run/0).
+
+hook_closure_hidden_run() ->
+    Secret = <<"s3cret-in-hook">>,
+    Hook = fun(_Conn) -> only_ok(Secret) end,
+    Pool = start(#{pool_size => 1, after_connect => Hook}),
+    ?assertEqual({error, {after_connect, {error, function_clause}}}, eysql_pool:checkout(Pool, 3000)),
+    Status = lists:flatten(io_lib:format("~p", [sys:get_status(Pool)])),
+    Warnings = [Text || {warning, Text} <- hook_logs()],
+    ?assertNotEqual([], Warnings),
+    [?assertEqual(nomatch, string:find(Text, "s3cret")) || Text <- [Status | Warnings]],
+    ?assertNotEqual(nomatch, string:find(Status, "#Fun<")),
+    [?assertNotEqual(nomatch, string:find(Text, "{eysql_pool_tests,only_ok,1,")) || Text <- Warnings],
+    stop(Pool).
+
+only_ok(ok) -> ok.
+
+%% Run `Test' with the pool's log events sent to this process.
+with_log(Test) ->
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    ok = logger:set_module_level(eysql_pool, info),
+    try
+        Test()
+    after
+        logger:unset_module_level(eysql_pool),
+        logger:remove_handler(?MODULE)
+    end.
+
+%% after_connect's log lines so far, as {Level, Text}.
+hook_logs() ->
+    receive
+        {eysql_log, Level, Text} ->
+            case string:find(Text, "after_connect") of
+                nomatch -> hook_logs();
+                _ -> [{Level, Text} | hook_logs()]
+            end
+    after 0 ->
+            []
+    end.
+
+log(#{level := Level, msg := Msg}, #{config := #{pid := Pid}}) ->
+    Pid ! {eysql_log, Level, lists:flatten(message(Msg))}.
+
+message({string, String}) -> unicode:characters_to_list(String);
+message({report, Report}) -> io_lib:format("~p", [Report]);
+message({Format, Args}) -> io_lib:format(Format, Args).

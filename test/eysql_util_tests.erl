@@ -35,7 +35,13 @@ redact_config_test_() ->
      {"a password fun goes too; empty options stay",
       ?_assertEqual(#{settings => #{password => redacted, ssl_opts => [], epgsql_opts => #{}}},
                     eysql_util:redact_config(Empty))},
-     {"a map without settings is left alone", ?_assertEqual(#{a => 1}, eysql_util:redact_config(#{a => 1}))}
+     {"a map without settings is left alone", ?_assertEqual(#{a => 1}, eysql_util:redact_config(#{a => 1}))},
+     {"an after_connect {Module, Function, Args} loses its Args",
+      ?_assertMatch(#{after_connect := {app_db, warm, redacted}},
+                    eysql_util:redact_config(Config#{after_connect => {app_db, warm, [<<"s3cret">>]}}))},
+     {"an after_connect fun stays, and undefined too",
+      [?_assertEqual(Hook, maps:get(after_connect, eysql_util:redact_config(Config#{after_connect => Hook})))
+       || Hook <- [fun erlang:is_process_alive/1, undefined]]}
     ].
 
 %% A config, or a connect spec, anywhere in a term: in a record, a stack

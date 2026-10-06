@@ -72,9 +72,43 @@
 %% with it. A process that dies while holding a connection loses it; the pool
 %% closes that connection, since its state is unknown, and opens another. Only
 %% the process holding a connection can return it.
+%%
+%% `after_connect' prepares each connection the pool opens before anyone
+%% gets it, replacements included: those for a connection that died, one
+%% past its lifetime, or one moved by a rebalance. The opener calls it with
+%% the connection once {@link eysql_cluster:open/1} has opened it, in a
+%% process of its own, and reports the connection only when it is done.
+%% Until then the connection counts as `opening', and checkouts wait for
+%% it. `ok', or a tuple whose first element is `ok', lets it into the pool.
+%% Anything else fails it: `{error, Reason}', an exception, another value,
+%% no answer within `after_connect_timeout', or a connection the hook left
+%% closed or inside a transaction. The opener closes the connection and
+%% reports the failure.
+%%
+%% The cluster marks no host for it: a failing hook is the application's,
+%% not the server's, and leaving servers out for it would let one bad
+%% statement take every server out of rotation. The pool steers its own
+%% connections instead, but only between the hosts a pick would choose
+%% among anyway ({@link eysql_cluster:pick/3}): a hook failure never changes
+%% the tier, topology level, node type or host order. For the cluster's
+%% failed-host delay after a hook fails on a host, new connections go to the
+%% other hosts the pick offers, if it offers any, and rebalancing moves
+%% nothing towards the host. A failure on a host the pool was not keeping
+%% off is replaced at once, which then keeps off it. A failure on one it
+%% had to take, the pick offering nothing else, as with `load_balance'
+%% false or a single host in the preferred level, is a failed open: the
+%% pool opens another after its refill delay, and fails waiting checkouts
+%% with `{error, {after_connect, Reason}}' when no other connection is
+%% coming. After the delay, picks and rebalancing try the host again. The
+%% first failure on a host is logged as a warning with the reason, and the
+%% end of the run once, at info, as the cluster logs a host's failed
+%% connects. The connections that discovery and probes open are the
+%% cluster's, and never run the hook.
 -module(eysql_pool).
 
 -behaviour(gen_server).
+
+-include_lib("kernel/include/logger.hrl").
 
 -export([start_link/1,
          start_link/2,
@@ -106,6 +140,12 @@
 -define(REFILL_DELAY, 1000).
 -define(ACK_TIMEOUT, 5000).
 -define(STOP_TIMEOUT, 1000).
+
+%% A run of after_connect failures on a host ends once a connection there
+%% has passed the hook and the run has gone this long without a failure, as
+%% a run of failed connects does in eysql_cluster. Tests shorten it with the
+%% same `log_window' key in the normalized config; it is not an option.
+-define(LOG_WINDOW, 60000).
 
 %% Where the process holding a connection keeps the pool's socket_timeout
 %% for it, `{Pool, Ms}', from checkout to checkin or discard, in its process
@@ -148,7 +188,11 @@
     refill_timer :: undefined | reference(),
     %% Leased connections to close when they come back, because their host
     %% is no longer allowed.
-    draining = #{} :: #{pid() => true}
+    draining = #{} :: #{pid() => true},
+    %% Each host's current run of after_connect failures, for logging: how
+    %% many, when the last was, and whether a connection there has passed
+    %% the hook since.
+    hook_runs = #{} :: #{eysql_topology:key() => {pos_integer(), integer(), boolean()}}
 }).
 
 %%%=============================================================================
@@ -331,17 +375,23 @@ handle_info({opened, Opener, {ok, Pid, Key}}, State) ->
     true = link(Pid),
     Opener ! {ack, self()},
     Conn = #conn{pid = Pid, key = Key, expires_at = eysql_util:now_ms() + lifetime(State)},
-    State1 = reported(Opener, State),
+    State1 = hook_worked(Key, reported(Opener, State)),
     {noreply, serve(State1#state{idle = [Conn | State1#state.idle]})};
-handle_info({opened, Opener, {error, Reason}}, State) ->
-    State1 = reported(Opener, State),
-    %% Waiters fail only when no connection can reach them: none idle and
-    %% none opening.
-    State2 = case State1#state.idle =:= [] andalso State1#state.opening =:= 0 of
-                 true -> fail_waiters({error, Reason}, State1);
-                 false -> State1
-             end,
-    {noreply, schedule_refill(State2)};
+handle_info({opened, Opener, {error, _} = Error}, State) ->
+    {noreply, open_failed(Opener, Error, State)};
+%% The connection opened, and failed after_connect; the opener has closed
+%% it. The host is not marked. When the opener went to that host as to any
+%% other, others may well pass the hook: a replacement opens at once, and
+%% keeps off the host, as new connections now do for a while, so that no
+%% waiter fails for one host's failure. When the opener had to take the
+%% host because the pick offered no other, the open failed as a failed
+%% connect does.
+handle_info({after_connect_failed, Opener, Key, Reason, Stack, Avoided}, State) ->
+    State1 = hook_failed(Key, Reason, Stack, State),
+    case Avoided of
+        false -> {noreply, serve(open_one(reported(Opener, State1)))};
+        true -> {noreply, open_failed(Opener, {error, {after_connect, Reason}}, State1)}
+    end;
 handle_info(refill, State) ->
     {noreply, serve(fill(State#state{refill_timer = undefined}))};
 %% Idle connections past their lifetime close on this tick too: the pool
@@ -357,6 +407,8 @@ handle_info(rebalance, State) ->
 handle_info({timeout, _Timer, {socket_timeout, Pid}}, State) ->
     _ = maps:is_key(Pid, State#state.leased) andalso exit(Pid, kill),
     {noreply, State};
+handle_info({timeout, _Timer, {after_connect_run_end, Key, Last}}, State) ->
+    {noreply, end_hook_run(Key, Last, State)};
 handle_info({'EXIT', Cluster, Reason}, #state{cluster = Cluster} = State) ->
     {stop, {cluster_exit, Reason}, State};
 handle_info({'EXIT', Pid, _Reason}, State) ->
@@ -466,22 +518,147 @@ fill(State) ->
 total(State) ->
     length(State#state.idle) + maps:size(State#state.leased) + State#state.opening.
 
-open_one(#state{cluster = Cluster} = State) ->
+%% The opener takes the hosts after_connect has just failed on, to keep the
+%% connection off them where the pick offers others (see
+%% eysql_cluster:pick/3), and says, when the hook fails, whether it had to
+%% take one of them.
+open_one(#state{cluster = Cluster, config = Config} = State) ->
     Pool = self(),
     Driver = driver_of(State),
+    %% A config normalized by an eysql before 0.1.2, as across a hot code
+    %% upgrade, or built by hand, may have neither key.
+    Hook = maps:get(after_connect, Config, undefined),
+    HookTimeout = maps:get(after_connect_timeout, Config,
+                           maps:get(after_connect_timeout, eysql_config:defaults())),
+    Avoid = hook_avoided(State),
     {Opener, _Monitor} =
         spawn_monitor(
           fun() ->
-                  case eysql_cluster:open(Cluster) of
+                  case eysql_cluster:open(Cluster, Avoid) of
                       {ok, Pid, Key} ->
-                          Pool ! {opened, self(), {ok, Pid, Key}},
-                          await_ack(Pool, Driver, Pid);
+                          case prepare(Hook, HookTimeout, Pool, Driver, Pid) of
+                              ok ->
+                                  Pool ! {opened, self(), {ok, Pid, Key}},
+                                  await_ack(Pool, Driver, Pid);
+                              {failed, Reason, Stack} ->
+                                  Pool ! {after_connect_failed, self(), Key, Reason, Stack,
+                                          lists:member(Key, Avoid)};
+                              pool_down ->
+                                  ok
+                          end;
                       {error, _} = Error ->
                           Pool ! {opened, self(), Error}
                   end
           end),
     State#state{openers = maps:put(Opener, opening, State#state.openers),
                 opening = State#state.opening + 1}.
+
+%% An open failed: the connect, or after_connect. Waiters fail only when no
+%% connection can reach them: none idle and none opening.
+open_failed(Opener, Error, State) ->
+    State1 = reported(Opener, State),
+    State2 = case State1#state.idle =:= [] andalso State1#state.opening =:= 0 of
+                 true -> fail_waiters(Error, State1);
+                 false -> State1
+             end,
+    schedule_refill(State2).
+
+%% Run after_connect on a connection that has just opened, in the opener,
+%% to which the connection is linked. The hook runs in a process of its
+%% own, linked to the opener, so that the opener can stop it when it
+%% overruns or the pool goes, and so that it dies if the opener is killed.
+%% Meanwhile the opener traps exits, so that neither the hook's process nor
+%% the connection can take it down before it reports. `pool_down' when the
+%% pool has gone, since there is no one left to report to; a pool already
+%% gone gets no hook run at all. On anything but `ok' the connection is
+%% closed here.
+prepare(undefined, _Timeout, _Pool, _Driver, _Conn) ->
+    ok;
+prepare(Hook, Timeout, Pool, Driver, Conn) ->
+    Trapping = process_flag(trap_exit, true),
+    PoolMonitor = erlang:monitor(process, Pool),
+    %% The monitor's 'DOWN' for a pool already gone can still be on its way;
+    %% is_process_alive/1 answers at once for a process on this node, as the
+    %% pool always is.
+    Outcome = case is_process_alive(Pool) of
+                  false -> pool_down;
+                  true -> run_prepare(Hook, Timeout, Pool, PoolMonitor, Driver, Conn)
+              end,
+    erlang:demonitor(PoolMonitor, [flush]),
+    case Outcome of
+        ok ->
+            _ = process_flag(trap_exit, Trapping),
+            ok;
+        _ ->
+            %% Close before trapping stops, so that the connection's exit
+            %% cannot take the opener down before it reports.
+            unlink(Conn),
+            Driver:close(Conn),
+            _ = process_flag(trap_exit, Trapping),
+            receive {'EXIT', Conn, _} -> ok after 0 -> ok end,
+            Outcome
+    end.
+
+run_prepare(Hook, Timeout, Pool, PoolMonitor, Driver, Conn) ->
+    Opener = self(),
+    {Runner, RunnerMonitor} =
+        spawn_opt(fun() -> Opener ! {after_connect, self(), run_hook(Hook, Conn)} end, [link, monitor]),
+    Outcome = receive
+                  {after_connect, Runner, Result} ->
+                      checked(Result, Driver, Conn);
+                  {'DOWN', RunnerMonitor, process, Runner, Reason} ->
+                      %% Killed by an exit signal: run_hook/2 catches the rest.
+                      {failed, {exit, Reason}, []};
+                  {'DOWN', PoolMonitor, process, Pool, _} ->
+                      pool_down
+              after Timeout ->
+                      %% Not `timeout', which a hook can return itself.
+                      {failed, {after_connect_timeout, Timeout}, []}
+              end,
+    unlink(Runner),
+    exit(Runner, kill),
+    erlang:demonitor(RunnerMonitor, [flush]),
+    receive {'EXIT', Runner, _} -> ok after 0 -> ok end,
+    Outcome.
+
+%% Runs in the hook's process. `ok', or a tuple tagged `ok' such as epgsql's
+%% query results, lets the connection in. An exception's stack trace is
+%% kept for the log: the hook's own frames, without the arguments a frame
+%% can carry, which may be the hook's data.
+run_hook(Hook, Conn) ->
+    try call_hook(Hook, Conn) of
+        ok -> ok;
+        Ok when tuple_size(Ok) >= 2, element(1, Ok) =:= ok -> ok;
+        {error, Reason} -> {failed, Reason, []};
+        Other -> {failed, {bad_return, Other}, []}
+    catch
+        Class:Reason:Stack ->
+            Own = lists:takewhile(fun(Frame) -> element(1, Frame) =/= ?MODULE end, Stack),
+            {failed, {Class, Reason}, [without_args(Frame) || Frame <- Own]}
+    end.
+
+call_hook(Fun, Conn) when is_function(Fun, 1) -> Fun(Conn);
+call_hook({Module, Function, Args}, Conn) -> apply(Module, Function, [Conn | Args]).
+
+without_args({Module, Function, Args, Location}) when is_list(Args) ->
+    {Module, Function, length(Args), Location};
+without_args(Frame) ->
+    Frame.
+
+%% A hook that says `ok' must leave the connection open, and outside a
+%% transaction, as eysql:with_connection/3 checks one before it goes back
+%% to the pool. The status is read without a round trip.
+checked(ok, Driver, Conn) ->
+    receive
+        {'EXIT', Conn, Why} -> {failed, {connection_lost, Why}, []}
+    after 0 ->
+            case Driver:transaction_status(Conn) of
+                idle -> ok;
+                Status -> {failed, {transaction_status, Status}, []}
+            end
+    end;
+checked(Failed, _Driver, _Conn) ->
+    Failed.
 
 %% An opener has reported how its connect went. It stays in `openers' until
 %% its monitor fires.
@@ -596,6 +773,15 @@ expire_idle(State) ->
 %% With `load_balance' false, and wherever new connections go to the seeds,
 %% the placement is the one seed that takes them, in order, so there is
 %% nothing to spread: connections gather on the first host that works.
+%%
+%% A host where after_connect has just failed, which new connections keep
+%% off (see hook_avoided/1), takes no part in finding the busiest either,
+%% though the cluster has not marked it. Otherwise it would be the quietest,
+%% and each rebalance would close good connections to make room on a host
+%% where the hook fails. Once that delay is over it takes part again, so a
+%% rebalance tries it with up to `rebalance_batch' connections: if the hook
+%% still fails, they reopen elsewhere and the delay starts again; if it
+%% passes, connections move back to the host.
 rebalance(State) ->
     #{rebalance_batch := Batch} = State#state.config,
     try eysql_cluster:snapshot(State#state.cluster) of
@@ -605,7 +791,7 @@ rebalance(State) ->
           failed := Failed, read_only := ReadOnly, rejected := Rejected} ->
             case strays(Allowed, State) of
                 {[], []} ->
-                    Out = Failed ++ ReadOnly ++ Rejected,
+                    Out = Failed ++ ReadOnly ++ Rejected ++ hook_avoided(State),
                     Busiest = busiest(Placement -- Out, Counts, State#state.idle),
                     close_idle(lists:sublist(Busiest, Batch), State#state{draining = #{}});
                 {IdleStrays, BusyStrays} ->
@@ -649,6 +835,93 @@ close_idle(Conns, State) ->
     Pids = [Pid || #conn{pid = Pid} <- Conns],
     Idle = [Conn || #conn{pid = Pid} = Conn <- State#state.idle, not lists:member(Pid, Pids)],
     lists:foldl(fun close/2, State#state{idle = Idle}, Conns).
+
+%%%=============================================================================
+%%% Logging after_connect's failures
+%%%=============================================================================
+
+%% A hook that fails, fails on every connection as a rule, so only the first
+%% failure of a run on each host is logged, with its reason, by the rules
+%% eysql_cluster logs a host's failed connects by. The run ends only once a
+%% connection to the host has passed the hook since its last failure and
+%% the window has passed since that failure. Per host, since a hook can
+%% fail on one server only, as on one that is slow to answer.
+hook_failed(Key, Reason, Stack, #state{hook_runs = Runs} = State) ->
+    Now = eysql_util:now_ms(),
+    case maps:find(Key, Runs) of
+        {ok, {Count, _Last, _Worked}} ->
+            State#state{hook_runs = maps:put(Key, {Count + 1, Now, false}, Runs)};
+        error ->
+            log_hook_failure(Key, Reason, Stack, State),
+            State#state{hook_runs = maps:put(Key, {1, Now, false}, Runs)}
+    end.
+
+%% A connection to `Key' passed the hook (or opened, with no hook set). The
+%% first since the run's last failure ends it once the window has passed
+%% since that failure: now, or on a timer.
+hook_worked(Key, #state{hook_runs = Runs} = State) ->
+    case maps:find(Key, Runs) of
+        {ok, {Count, Last, false}} ->
+            State1 = State#state{hook_runs = maps:put(Key, {Count, Last, true}, Runs)},
+            case Last + log_window(State) - eysql_util:now_ms() of
+                Wait when Wait > 0 ->
+                    _ = erlang:start_timer(Wait, self(), {after_connect_run_end, Key, Last}),
+                    State1;
+                _ ->
+                    end_hook_run(Key, Last, State1)
+            end;
+        _ ->
+            State
+    end.
+
+%% The window has passed since `Key''s failure at `Last'. The run ends if
+%% that is still its last failure and a connection has passed the hook
+%% since; a timer left over from an earlier failure finds neither.
+end_hook_run({Host, Port} = Key, Last, #state{hook_runs = Runs} = State) ->
+    case maps:find(Key, Runs) of
+        {ok, {Count, Last, true}} ->
+            ?LOG_INFO("eysql: after_connect works on connections to ~s:~b again after ~b failures, "
+                      "with none in the last ~b ms", [Host, Port, Count, log_window(State)]),
+            State#state{hook_runs = maps:remove(Key, Runs)};
+        _ ->
+            State
+    end.
+
+log_hook_failure({Host, Port}, Reason, Stack, State) ->
+    ?LOG_WARNING("eysql: after_connect failed on a new connection to ~s:~b~ts~ts; closing the connection, "
+                 "keeping the pool's new connections off ~s:~b for ~b ms where it has another server of "
+                 "the same choice, without marking it failed, and not logging after_connect's failures "
+                 "there again until it has gone ~b ms without one",
+                 [Host, Port, hook_why(Reason, State), raised_at(Stack), Host, Port, avoid_delay(State),
+                  log_window(State)]).
+
+%% The reason, with any password in it hidden, as for a failed connect.
+hook_why({after_connect_timeout, Ms}, _State) ->
+    io_lib:format(" (still running after ~p ms, its after_connect_timeout)", [Ms]);
+hook_why(Reason, _State) ->
+    io_lib:format(" (~0tP)", [eysql_util:redact_reason(Reason), 30]).
+
+%% Where an exception came from: the innermost frames, without arguments.
+raised_at([]) -> "";
+raised_at(Stack) -> io_lib:format(", raised at ~0tP", [lists:sublist(Stack, 3), 20]).
+
+log_window(#state{config = Config}) ->
+    maps:get(log_window, Config, ?LOG_WINDOW).
+
+%% The hosts where after_connect failed last, with no connection passing it
+%% there since, and that failure recent: new connections keep off them where
+%% the pick has other hosts to choose among, and rebalancing moves nothing
+%% towards them. Recent is the cluster's failed-host delay,
+%% `failed_host_reconnect_delay_secs', but at least the refill delay, so
+%% that the replacement opened at once after a failure keeps off its host.
+%% After that a new connection may go there again, and find out whether
+%% the hook passes there now.
+hook_avoided(#state{hook_runs = Runs} = State) ->
+    Since = eysql_util:now_ms() - avoid_delay(State),
+    [Key || {Key, {_Count, Last, false}} <- maps:to_list(Runs), Last > Since].
+
+avoid_delay(#state{config = #{failed_host_delay := Delay}}) ->
+    max(Delay, ?REFILL_DELAY).
 
 %%%=============================================================================
 %%% Helpers

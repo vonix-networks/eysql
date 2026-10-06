@@ -33,6 +33,8 @@
          set_servers/1,
          set_discover_error/1,
          set_discover_delay/1,
+         set_open_delay/1,
+         opening/0,
          down/1,
          up/1,
          reject/2,
@@ -85,6 +87,12 @@ set_servers(Servers) -> ets:insert(?TABLE, {discover, {ok, Servers}}).
 set_discover_error(Error) -> ets:insert(?TABLE, {discover, {error, Error}}).
 %% discover/1 answers after this many ms.
 set_discover_delay(Ms) -> ets:insert(?TABLE, {discover_delay, Ms}).
+%% open/3 waits this many ms before it goes on as it would.
+set_open_delay(Ms) -> ets:insert(?TABLE, {open_delay, Ms}).
+
+%% The processes waiting out the open delay.
+opening() ->
+    [Pid || {{opening, Pid}, _Key} <- ets:tab2list(?TABLE), is_process_alive(Pid)].
 down(Key) -> ets:insert(?TABLE, {{down, Key}, true}).
 %% Connects to this host succeed again, from now on: one under way goes on
 %% as it began.
@@ -165,6 +173,14 @@ pg_error(Code) ->
 
 open(Host, Port, Settings) ->
     Key = {Host, Port},
+    case ets:lookup(?TABLE, open_delay) of
+        [{open_delay, Ms}] ->
+            ets:insert(?TABLE, {{opening, self()}, Key}),
+            timer:sleep(Ms),
+            ets:delete(?TABLE, {opening, self()});
+        [] ->
+            ok
+    end,
     case ets:lookup(?TABLE, {crash, Key}) of
         [_] -> erlang:error({fake_crash, Key});
         [] -> ok

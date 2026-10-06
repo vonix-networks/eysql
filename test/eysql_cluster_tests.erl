@@ -94,7 +94,9 @@ cluster_test_() ->
       {"failed_host_reconnect_delay_secs 0: the refresh a failure brings forward probes the host",
        {timeout, 15, fun zero_delay/0}},
       {"with load_balance false, hosts are taken in the order given", {timeout, 15, fun static_in_order/0}},
-      {"the seeds are taken in order in every mode", fun seeds_in_order/0}
+      {"the seeds are taken in order in every mode", fun seeds_in_order/0},
+      {"a pick that avoids hosts keeps the tier, level, node type and order it would use",
+       {timeout, 15, fun avoid_keeps_preference/0}}
      ]}.
 
 start(Overrides) ->
@@ -1701,3 +1703,76 @@ seeds_in_order() ->
 
 three_keys() ->
     [key(H) || H <- [<<"a">>, <<"b">>, <<"c">>]].
+
+%% A pick told to avoid hosts, as a pool's is after its after_connect hook
+%% fails there, chooses among the hosts it would choose among anyway, less
+%% those, or among all of them when that leaves none. It never moves to a
+%% later topology level, another node type, a later host in the order
+%% given, or a seed while discovered servers work.
+avoid_keeps_preference() ->
+    Zoned = fun(Host, Zone) -> eysql_fake_driver:server(Host, <<"gcp">>, <<"us-east1">>, Zone) end,
+    Replica = fun(Host) ->
+                      eysql_fake_driver:server(Host, <<"gcp">>, <<"us-east1">>, <<"us-east1-b">>, read_replica)
+              end,
+    [A, A2, B, C, R] = [key(H) || H <- [<<"a">>, <<"a2">>, <<"b">>, <<"c">>, <<"r">>]],
+    %% Topology levels: a and a2 in the preferred zone, b and c in the second.
+    eysql_fake_driver:set_servers([Zoned(<<"a">>, <<"us-east1-b">>), Zoned(<<"a2">>, <<"us-east1-b">>),
+                                   Zoned(<<"b">>, <<"us-east1-c">>), Zoned(<<"c">>, <<"us-east1-d">>)]),
+    Levels = start(#{topology_keys => "gcp.us-east1.us-east1-b:1,gcp.us-east1.*:2"}),
+    discovered(Levels),
+    ?assertEqual([A2], picks(Levels, [A])),
+    ?assertEqual([A, A2], picks(Levels, [A, A2])),
+    ?assertEqual([A, A2], picks(Levels, [A, A2, B, C])),
+    ?assertMatch({ok, _, A2}, eysql_cluster:open(Levels, [A])),
+    eysql_cluster:stop(Levels),
+    %% prefer_primary: the primary, though the replica is free.
+    eysql_fake_driver:set_servers([Zoned(<<"a">>, <<"us-east1-b">>), Replica(<<"r">>)]),
+    Prefer = start(#{load_balance => prefer_primary}),
+    discovered(Prefer),
+    ?assertEqual([A], picks(Prefer, [A])),
+    eysql_cluster:stop(Prefer),
+    %% only_primary: the other primary, or either, never the replica.
+    eysql_fake_driver:set_servers([Zoned(<<"a">>, <<"us-east1-b">>), Zoned(<<"a2">>, <<"us-east1-c">>),
+                                   Replica(<<"r">>)]),
+    Only = start(#{load_balance => only_primary}),
+    discovered(Only),
+    ?assertEqual([A2], picks(Only, [A])),
+    ?assertEqual([A, A2], picks(Only, [A, A2])),
+    ?assertNot(lists:member(R, picks(Only, [A, A2]))),
+    eysql_cluster:stop(Only),
+    %% load_balance false: the first host, always.
+    Static = start(#{load_balance => false, hosts => [A, B, C]}),
+    ?assertEqual([A], picks(Static, [A])),
+    ?assertMatch({ok, _, A}, eysql_cluster:open(Static, [A])),
+    eysql_cluster:stop(Static),
+    %% A seed behind a load balancer takes nothing while a server works,
+    %% and the seed, once it is all there is, is taken as before.
+    eysql_fake_driver:set_servers(three()),
+    Lb = {<<"lb">>, 5433},
+    Behind = start(#{hosts => [Lb]}),
+    discovered(Behind),
+    ?assertEqual([A, B, C], picks(Behind, [A, B, C])),
+    [fail(Behind, Key) || Key <- [A, B, C]],
+    ?assertEqual([A, B, C], failed(Behind)),
+    ?assertEqual([Lb], picks(Behind, [Lb])),
+    eysql_cluster:stop(Behind),
+    %% fallback_to_topology_keys_only: a alone, and once a has failed, the
+    %% refusal, as without Avoid.
+    Fallback = start(#{topology_keys => "gcp.us-east1.us-east1-b", fallback_to_topology_keys_only => true}),
+    discovered(Fallback),
+    ?assertEqual([A], picks(Fallback, [A])),
+    fail(Fallback, A),
+    ?assertEqual({error, {no_node_available, cluster}}, eysql_cluster:pick(Fallback, [], [A])),
+    ?assertEqual({error, {no_node_available, cluster}}, eysql_cluster:pick(Fallback, [], [])),
+    eysql_cluster:stop(Fallback).
+
+%% The hosts a hundred picks avoiding `Avoid' went to, each given back at
+%% once. Ties go to a server at random, so with three tied servers twenty
+%% picks would miss one about once in 1,100 runs; a hundred makes that about
+%% once in 10^17.
+picks(Cluster, Avoid) ->
+    lists:usort([begin
+                     {ok, _Server, _Spec, {_Ref, Key} = Reservation} = eysql_cluster:pick(Cluster, [], Avoid),
+                     eysql_cluster:cancel(Cluster, Reservation),
+                     Key
+                 end || _ <- lists:seq(1, 100)]).

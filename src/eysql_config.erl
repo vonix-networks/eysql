@@ -106,6 +106,17 @@ defaults() ->
       lifetime_jitter => 300000,
       rebalance_interval => 30000,
       rebalance_batch => 2,
+      %% Run on each connection the pool opens, after it opens and before
+      %% the pool hands it to anyone, to prepare it: `undefined', a fun of
+      %% one argument, the connection, or `{Module, Function, Args}', called
+      %% as apply(Module, Function, [Conn | Args]). `ok', or a tuple whose
+      %% first element is `ok', lets the connection into the pool; anything
+      %% else closes it, and the pool opens another. Not run on the
+      %% connections discovery and probes open. See eysql_pool.
+      after_connect => undefined,
+      %% Milliseconds, or infinity: how long after_connect may run before
+      %% the connection is closed as failed.
+      after_connect_timeout => 60000,
 
       %% Testing seam; see eysql_driver.
       driver => eysql_conn
@@ -142,7 +153,9 @@ build(Options) ->
                    max_lifetime => pos_int(max_lifetime, Options),
                    lifetime_jitter => non_neg_int(lifetime_jitter, Options),
                    rebalance_interval => pos_int(rebalance_interval, Options),
-                   rebalance_batch => pos_int(rebalance_batch, Options)
+                   rebalance_batch => pos_int(rebalance_batch, Options),
+                   after_connect => after_connect(maps:get(after_connect, Options)),
+                   after_connect_timeout => after_connect_timeout(maps:get(after_connect_timeout, Options))
                   },
         {ok, Config}
     catch
@@ -277,6 +290,32 @@ statement_timeout(Value) -> throw({invalid, statement_timeout, Value}).
 socket_timeout(infinity) -> infinity;
 socket_timeout(Ms) when is_integer(Ms), Ms > 0 -> Ms;
 socket_timeout(Value) -> throw({invalid, socket_timeout, Value}).
+
+%% The hook is kept as given, as the password fun is. Whether `Function' is
+%% exported is not checked here: its module may not be loaded yet. A call
+%% that fails, `undef' included, fails the connection it prepares.
+after_connect(undefined) ->
+    undefined;
+after_connect(Fun) when is_function(Fun, 1) ->
+    Fun;
+after_connect({Module, Function, Args} = Mfa) when is_atom(Module), is_atom(Function) ->
+    case proper_list(Args) of
+        true -> Mfa;
+        false -> throw({invalid, after_connect, Mfa})
+    end;
+after_connect(Value) ->
+    throw({invalid, after_connect, Value}).
+
+%% A bound of 0 would fail every connection, so off is `infinity', as for
+%% socket_timeout. The opener waits with `receive ... after', which takes
+%% at most 2^32 - 1 ms, about 49 days.
+after_connect_timeout(infinity) -> infinity;
+after_connect_timeout(Ms) when is_integer(Ms), Ms > 0, Ms =< 16#FFFFFFFF -> Ms;
+after_connect_timeout(Value) -> throw({invalid, after_connect_timeout, Value}).
+
+proper_list([]) -> true;
+proper_list([_ | Tail]) -> proper_list(Tail);
+proper_list(_) -> false.
 
 %% The password as epgsql takes it: a binary, a string as UTF-8, or the
 %% caller's own zero-arity fun, kept as it is. Unlike a text option, a binary

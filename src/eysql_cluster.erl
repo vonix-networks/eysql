@@ -156,8 +156,10 @@
          stop/1,
          connect/1,
          open/1,
+         open/2,
          pick/1,
          pick/2,
+         pick/3,
          opened/3,
          open_failed/2,
          open_failed/3,
@@ -295,14 +297,22 @@ connect(Cluster) ->
 %% @doc As {@link connect/1}, also returning the host the connection went to.
 -spec open(cluster()) -> {ok, pid(), eysql_topology:key()} | {error, term()}.
 open(Cluster) ->
+    open(Cluster, []).
+
+%% @doc As {@link open/1}, preferring the hosts a pick would choose among
+%% that are not in `Avoid' (see {@link pick/3}). The pool passes the hosts
+%% its `after_connect' hook has just failed on. It marks nothing: other
+%% callers still connect to those hosts.
+-spec open(cluster(), [eysql_topology:key()]) -> {ok, pid(), eysql_topology:key()} | {error, term()}.
+open(Cluster, Avoid) ->
     await_ready(Cluster),
-    open(Cluster, [], {error, no_server_available}).
+    open(Cluster, Avoid, [], {error, no_server_available}).
 
 %% `Tried' holds the hosts this open has tried, as getConnection's
 %% failedHosts do: a host that failed is left out of picks anyway, but the
 %% seeds' last resort takes failed seeds, and none may be tried twice.
-open(Cluster, Tried, LastError) ->
-    case pick(Cluster, Tried) of
+open(Cluster, Avoid, Tried, LastError) ->
+    case pick(Cluster, Tried, Avoid) of
         {ok, #{host := Host, port := Port}, Spec, Reservation} ->
             Result = try connect_to(Host, Port, Spec)
                      catch
@@ -316,7 +326,7 @@ open(Cluster, Tried, LastError) ->
                     {ok, Conn, {Host, Port}};
                 {error, Why} = Error ->
                     open_failed(Cluster, Reservation, Why),
-                    open(Cluster, [{Host, Port} | Tried], Error)
+                    open(Cluster, Avoid, [{Host, Port} | Tried], Error)
             end;
         {error, {no_node_available, _}} = Refused ->
             Refused;
@@ -387,8 +397,21 @@ pick(Cluster) ->
           {ok, eysql_topology:server(), connect_spec(), reservation()}
         | {error, pick_error()}.
 pick(Cluster, Tried) ->
+    pick(Cluster, Tried, []).
+
+%% @doc As {@link pick/2}, choosing among the hosts it would choose among
+%% less those in `Avoid', or among all of them when that leaves none.
+%% `Avoid' never changes which hosts those are: the tier, the topology
+%% level, the node type and, for the seeds and with `load_balance' false,
+%% the order stay what {@link pick/2} uses. With `load_balance' false that
+%% is the one host that comes first, so `Avoid' changes nothing there. Nor
+%% is it a failure: the hosts are not marked, logged or probed.
+-spec pick(cluster(), [eysql_topology:key()], [eysql_topology:key()]) ->
+          {ok, eysql_topology:server(), connect_spec(), reservation()}
+        | {error, pick_error()}.
+pick(Cluster, Tried, Avoid) ->
     Ref = make_ref(),
-    try gen_server:call(Cluster, {pick, Ref, Tried}, ?CALL_TIMEOUT) of
+    try gen_server:call(Cluster, {pick, Ref, Tried, Avoid}, ?CALL_TIMEOUT) of
         {ok, Server, Spec} -> {ok, Server, Spec, {Ref, eysql_topology:key(Server)}};
         {error, _} = Error -> Error
     catch
@@ -504,9 +527,9 @@ init(Config) ->
             {ok, State}
     end.
 
-handle_call({pick, Ref, Tried}, {Picker, _}, State0) ->
+handle_call({pick, Ref, Tried, Avoid}, {Picker, _}, State0) ->
     State = refresh_if_due(State0),
-    case choose(State, Tried) of
+    case choose(State, Tried, Avoid) of
         {ok, Server} ->
             Key = eysql_topology:key(Server),
             %% Released when the picker reports, or if it exits first.
@@ -626,6 +649,20 @@ choose(State, Tried) ->
     case eysql_topology:choose(placement(State, Tried), fun(Server) -> load(Server, State) end) of
         {ok, _} = Chosen -> Chosen;
         {error, no_server_available} = None -> refusal(State, None)
+    end.
+
+%% As choose/2, among the candidates choose/2 would use less the hosts in
+%% `Avoid', or as choose/2 when that leaves none. The candidates are the
+%% ones placement/2 gives, so the tier, level, node type and order are
+%% always the ones choose/2 would use.
+choose(State, Tried, []) ->
+    choose(State, Tried);
+choose(State, Tried, Avoid) ->
+    Kept = [Server || Server <- placement(State, Tried),
+                      not lists:member(eysql_topology:key(Server), Avoid)],
+    case Kept of
+        [] -> choose(State, Tried);
+        _ -> eysql_topology:choose(Kept, fun(Server) -> load(Server, State) end)
     end.
 
 %% getLeastLoadedServer throws "No node available in the given placements
@@ -1039,20 +1076,9 @@ log_window(#state{config = Config}) ->
 
 %% The reason for the warning, if the caller gave one. A connect error can
 %% echo options, as an ssl option error does the option it rejects, so
-%% passwords and configs in it are hidden.
+%% passwords and configs in it are hidden (eysql_util:redact_reason/1).
 why(undefined) -> "";
-why(Reason) -> io_lib:format(" (~0tP)", [hide(eysql_util:redact(Reason)), 30]).
-
-%% A password sits in a proplist as `{password, _}', and in a map, such as
-%% epgsql's connect options, under a `password' key, atom or binary.
-hide({password, _}) -> {password, redacted};
-hide([Head | Tail]) -> [hide(Head) | hide(Tail)];
-hide(Tuple) when is_tuple(Tuple) -> list_to_tuple(hide(tuple_to_list(Tuple)));
-hide(Map) when is_map(Map) -> maps:map(fun hide/2, Map);
-hide(Term) -> Term.
-
-hide(Key, _Value) when Key =:= password; Key =:= <<"password">> -> redacted;
-hide(_Key, Value) -> hide(Value).
+why(Reason) -> io_lib:format(" (~0tP)", [eysql_util:redact_reason(Reason), 30]).
 
 %%%=============================================================================
 %%% Refreshes and discovery
